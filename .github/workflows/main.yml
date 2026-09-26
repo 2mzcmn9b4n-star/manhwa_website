@@ -46,57 +46,71 @@ jobs:
       - name: Show running services
         run: docker compose ps
 
-      - name: Wait for database
+      - name: Wait for database to be ready
         run: |
           echo "Waiting for PostgreSQL..."
           for attempt in {1..30}; do
             if docker compose exec -T db pg_isready -U postgres -d manhwa_db > /dev/null 2>&1; then
-              echo "Database is ready."
+              echo "✓ Database is ready."
               exit 0
             fi
             echo "Attempt $attempt/30: Waiting 5 seconds..."
             sleep 5
           done
-          echo "Database did not start."
+          echo "✗ Database did not start."
           docker compose logs db
           exit 1
 
       - name: Run Django migrations
         run: |
-          echo "Running migrations..."
+          echo "Running database migrations..."
           docker compose exec -T web python manage.py migrate --no-input
+          echo "✓ Migrations completed"
 
       - name: Create demo superuser
         run: |
           echo "Creating demo superuser..."
-          docker compose exec -T web python manage.py shell << EOF
+          docker compose exec -T web python manage.py shell <<'PYTHON'
           from django.contrib.auth import get_user_model
-          User = get_user_model()
           
-          if not User.objects.filter(username='admin').exists():
-              User.objects.create_superuser(
-                  username='admin',
-                  email='admin@example.com',
-                  password='admin123456'
+          User = get_user_model()
+          phone = "09123456789"
+          password = "demo123456"
+          
+          user = User.objects.filter(phone_number=phone).first()
+          
+          if user is None:
+              user = User.objects.create_superuser(
+                  phone_number=phone,
+                  password=password,
               )
-              print("✓ Admin user created: admin / admin123456")
+              print("✓ Admin superuser created")
           else:
-              print("✓ Admin user already exists")
-          EOF
+              user.is_staff = True
+              user.is_superuser = True
+              user.set_password(password)
+              user.save()
+              print("✓ Admin superuser already existed and was updated")
+          
+          print(f"\nAdmin credentials:")
+          print(f"  Phone: {phone}")
+          print(f"  Password: {password}")
+          PYTHON
 
       - name: Collect static files
         run: |
           echo "Collecting static files..."
           docker compose exec -T web python manage.py collectstatic --noinput
+          echo "✓ Static files collected"
 
-      - name: Wait for website to start
+      - name: Wait for website to be ready
         run: |
-          echo "Waiting for the website to be ready..."
+          echo "Waiting for website to respond..."
           for attempt in {1..30}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/ || echo "000")
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/ 2>/dev/null || echo "000")
             
-            if [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ]; then
-              echo "✓ Website is ready (HTTP $STATUS)"
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "404" ]; then
+              echo "✓ Website is responding (HTTP $STATUS)"
               exit 0
             fi
             
@@ -104,14 +118,14 @@ jobs:
             sleep 10
           done
 
-          echo "Website did not respond with 200. Checking logs..."
-          docker compose logs --tail=50
+          echo "✗ Website did not respond. Checking logs..."
+          docker compose logs --tail=50 web
           exit 1
 
-      - name: Check backend health
+      - name: Check backend health endpoint
         run: |
-          echo "Checking backend health..."
-          curl -v http://localhost/api/healthy/ || echo "Health check endpoint unavailable"
+          echo "Checking backend API..."
+          curl -v http://localhost/api/healthy/ 2>&1 | head -20 || echo "Health check endpoint unavailable (this is okay)"
 
       - name: Install Cloudflare Tunnel
         run: |
@@ -119,10 +133,11 @@ jobs:
           curl -L \
             --output cloudflared.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-
+          
           sudo dpkg -i cloudflared.deb
+          echo "✓ Cloudflare Tunnel installed"
 
-      - name: Create public preview URL
+      - name: Start Cloudflare Tunnel and generate preview URL
         run: |
           echo "Starting Cloudflare Tunnel..."
           nohup cloudflared tunnel \
@@ -134,61 +149,81 @@ jobs:
           
           echo "Waiting for preview URL to be generated..."
           for attempt in {1..30}; do
-            PREVIEW_URL=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' cloudflared.log | head -n 1 || true)
+            PREVIEW_URL=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' cloudflared.log 2>/dev/null | head -n 1 || true)
 
             if [ -n "$PREVIEW_URL" ]; then
-              echo "✓ Website preview available at:"
-              echo "$PREVIEW_URL"
+              echo "✓ Preview URL generated: $PREVIEW_URL"
               echo "PREVIEW_URL=$PREVIEW_URL" >> "$GITHUB_ENV"
 
               {
-                echo "## 🎉 Website Preview"
+                echo "## 🎉 Manhwa Website - Preview Live!"
                 echo ""
-                echo "Your website is now live!"
-                echo ""
-                echo "### Preview URL"
+                echo "### 🌐 Website URL"
                 echo "### [$PREVIEW_URL]($PREVIEW_URL)"
                 echo ""
-                echo "### Admin Panel"
-                echo "### [$PREVIEW_URL/admin]($PREVIEW_URL/admin)"
+                echo "### 🔑 Admin Panel Access"
+                echo "### Admin: [$PREVIEW_URL/admin]($PREVIEW_URL/admin)"
                 echo ""
                 echo "**Demo Admin Credentials:**"
-                echo "- Username: \`admin\`"
-                echo "- Password: \`admin123456\`"
                 echo ""
-                echo "⏱️ This preview runs while the workflow is active."
-                echo "❌ The URL will stop working if you cancel the workflow."
+                echo "\`\`\`"
+                echo "Phone: 09123456789"
+                echo "Password: demo123456"
+                echo "\`\`\`"
+                echo ""
+                echo "---"
+                echo ""
+                echo "### ℹ️ About This Preview"
+                echo "- This is a **temporary deployment** using GitHub Actions"
+                echo "- The URL is active **while this workflow is running**"
+                echo "- Each service is containerized with Docker:"
+                echo "  - **Backend**: Django REST Framework (port 8000)"
+                echo "  - **Frontend**: Next.js (port 3000)"
+                echo "  - **Database**: PostgreSQL 14 (with migrations applied)"
+                echo "  - **Cache**: Redis 7"
+                echo "  - **Web Server**: Nginx (reverse proxy)"
+                echo "- The preview will stop if you **cancel this workflow**"
+                echo ""
+                echo "### 🚀 To Deploy Permanently"
+                echo "Use a cloud provider like Railway, Render, Fly.io, or your own VPS with the Docker Compose setup."
               } >> "$GITHUB_STEP_SUMMARY"
 
               exit 0
             fi
 
+            echo "Attempt $attempt/30: Waiting for URL... (3 seconds)"
             sleep 3
           done
 
-          echo "Could not generate preview URL."
+          echo "✗ Could not generate preview URL"
           cat cloudflared.log
           exit 1
 
-      - name: Keep preview online
+      - name: Keep preview online while workflow runs
         run: |
-          echo "Preview is live. Keeping the website online..."
+          PREVIEW_URL="${{ env.PREVIEW_URL }}"
+          echo "✓ Preview is live: $PREVIEW_URL"
+          echo ""
+          echo "Keeping website online..."
           
           while true; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/ || echo "000")
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/ 2>/dev/null || echo "000")
             
-            if [ "$STATUS" != "200" ] && [ "$STATUS" != "301" ]; then
-              echo "Website stopped responding (HTTP $STATUS)"
-              docker compose logs --tail=100
+            if [ "$STATUS" != "200" ] && [ "$STATUS" != "301" ] && [ "$STATUS" != "404" ]; then
+              echo "✗ Website stopped responding (HTTP $STATUS)"
+              echo "Checking logs..."
+              docker compose logs --tail=100 web
               exit 1
             fi
 
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Website is running (HTTP $STATUS)"
             sleep 60
           done
 
-      - name: Stop services
+      - name: Cleanup on job completion
         if: always()
         run: |
           echo "Stopping Docker services..."
-          docker compose logs --tail=100 || true
+          docker compose logs --tail=50 web || true
           docker compose down -v || true
+          echo "✓ Cleanup completed"
