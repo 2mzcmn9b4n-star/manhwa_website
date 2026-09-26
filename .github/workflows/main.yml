@@ -1,0 +1,145 @@
+name: Deploy Website Preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-preview:
+    name: Build, run, and preview website
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create production environment file
+        env:
+          SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          cat > .env <<EOF
+          STAGE=production
+          SECRET_KEY=${SECRET_KEY:-github-actions-preview-secret-key}
+          DEBUG=False
+
+          DB_ENGINE=postgresql
+          DB_NAME=manhwa_db
+          DB_USER=postgres
+          DB_PASSWORD=${DB_PASSWORD:-preview-db-password}
+          DB_HOST=db
+          DB_PORT=5432
+
+          REDIS_URL=redis://redis:6379/0
+          EOF
+
+      - name: Build and start Docker services
+        env:
+          DOCKER_BUILDKIT: 1
+          COMPOSE_DOCKER_CLI_BUILD: 1
+        run: |
+          docker compose up -d --build
+
+      - name: Show running services
+        run: docker compose ps
+
+      - name: Wait for website to start
+        run: |
+          echo "Waiting for the website..."
+
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://localhost/ > /dev/null; then
+              echo "Website is ready."
+              exit 0
+            fi
+
+            echo "Attempt $attempt/30 failed. Waiting 10 seconds..."
+            sleep 10
+          done
+
+          echo "The website did not start successfully."
+          docker compose ps
+          docker compose logs --tail=200
+          exit 1
+
+      - name: Check backend health
+        run: |
+          curl --fail --silent --show-error \
+            http://localhost/api/healthy/ || \
+            echo "Backend health endpoint is unavailable; continuing because the frontend is running."
+
+      - name: Install Cloudflare Tunnel
+        run: |
+          curl -L \
+            --output cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+
+          sudo dpkg -i cloudflared.deb
+
+      - name: Create public preview URL
+        run: |
+          nohup cloudflared tunnel \
+            --url http://localhost:80 \
+            --no-autoupdate \
+            > cloudflared.log 2>&1 &
+
+          echo $! > cloudflared.pid
+
+          echo "Waiting for Cloudflare Tunnel URL..."
+
+          for attempt in {1..30}; do
+            PREVIEW_URL=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' cloudflared.log | head -n 1 || true)
+
+            if [ -n "$PREVIEW_URL" ]; then
+              echo "Website preview: $PREVIEW_URL"
+              echo "PREVIEW_URL=$PREVIEW_URL" >> "$GITHUB_ENV"
+
+              {
+                echo "## Website Preview"
+                echo
+                echo "Your website is available at:"
+                echo
+                echo "### [$PREVIEW_URL]($PREVIEW_URL)"
+                echo
+                echo "> This temporary URL works while this GitHub Actions job is running."
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "Could not create a public preview URL."
+          cat cloudflared.log
+          exit 1
+
+      - name: Keep preview online
+        run: |
+          echo "The website preview is available at:"
+          echo "$PREVIEW_URL"
+          echo
+          echo "Keep this workflow running to keep the preview online."
+
+          while true; do
+            if ! curl --fail --silent http://localhost/ > /dev/null; then
+              echo "Website stopped responding."
+              docker compose ps
+              docker compose logs --tail=100
+              exit 1
+            fi
+
+            sleep 60
+          done
+
+      - name: Stop services
+        if: always()
+        run: |
+          docker compose logs --tail=200 || true
+          docker compose down -v || true
