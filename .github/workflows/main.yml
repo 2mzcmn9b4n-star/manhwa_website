@@ -20,19 +20,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Create production environment file
-        env:
-          SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           cat > .env <<EOF
           STAGE=production
-          SECRET_KEY=${SECRET_KEY:-github-actions-preview-secret-key}
+          SECRET_KEY=github-actions-preview-key-$(date +%s)
           DEBUG=False
 
           DB_ENGINE=postgresql
           DB_NAME=manhwa_db
           DB_USER=postgres
-          DB_PASSWORD=${DB_PASSWORD:-preview-db-password}
+          DB_PASSWORD=preview-db-password
           DB_HOST=db
           DB_PORT=5432
 
@@ -49,33 +46,76 @@ jobs:
       - name: Show running services
         run: docker compose ps
 
-      - name: Wait for website to start
+      - name: Wait for database
         run: |
-          echo "Waiting for the website..."
-
+          echo "Waiting for PostgreSQL..."
           for attempt in {1..30}; do
-            if curl --fail --silent --show-error http://localhost/ > /dev/null; then
-              echo "Website is ready."
+            if docker compose exec -T db pg_isready -U postgres -d manhwa_db > /dev/null 2>&1; then
+              echo "Database is ready."
               exit 0
             fi
+            echo "Attempt $attempt/30: Waiting 5 seconds..."
+            sleep 5
+          done
+          echo "Database did not start."
+          docker compose logs db
+          exit 1
 
-            echo "Attempt $attempt/30 failed. Waiting 10 seconds..."
+      - name: Run Django migrations
+        run: |
+          echo "Running migrations..."
+          docker compose exec -T web python manage.py migrate --no-input
+
+      - name: Create demo superuser
+        run: |
+          echo "Creating demo superuser..."
+          docker compose exec -T web python manage.py shell << EOF
+          from django.contrib.auth import get_user_model
+          User = get_user_model()
+          
+          if not User.objects.filter(username='admin').exists():
+              User.objects.create_superuser(
+                  username='admin',
+                  email='admin@example.com',
+                  password='admin123456'
+              )
+              print("✓ Admin user created: admin / admin123456")
+          else:
+              print("✓ Admin user already exists")
+          EOF
+
+      - name: Collect static files
+        run: |
+          echo "Collecting static files..."
+          docker compose exec -T web python manage.py collectstatic --noinput
+
+      - name: Wait for website to start
+        run: |
+          echo "Waiting for the website to be ready..."
+          for attempt in {1..30}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/ || echo "000")
+            
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ]; then
+              echo "✓ Website is ready (HTTP $STATUS)"
+              exit 0
+            fi
+            
+            echo "Attempt $attempt/30: Got HTTP $STATUS. Waiting 10 seconds..."
             sleep 10
           done
 
-          echo "The website did not start successfully."
-          docker compose ps
-          docker compose logs --tail=200
+          echo "Website did not respond with 200. Checking logs..."
+          docker compose logs --tail=50
           exit 1
 
       - name: Check backend health
         run: |
-          curl --fail --silent --show-error \
-            http://localhost/api/healthy/ || \
-            echo "Backend health endpoint is unavailable; continuing because the frontend is running."
+          echo "Checking backend health..."
+          curl -v http://localhost/api/healthy/ || echo "Health check endpoint unavailable"
 
       - name: Install Cloudflare Tunnel
         run: |
+          echo "Installing Cloudflare Tunnel..."
           curl -L \
             --output cloudflared.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
@@ -84,53 +124,61 @@ jobs:
 
       - name: Create public preview URL
         run: |
+          echo "Starting Cloudflare Tunnel..."
           nohup cloudflared tunnel \
             --url http://localhost:80 \
             --no-autoupdate \
             > cloudflared.log 2>&1 &
 
           echo $! > cloudflared.pid
-
-          echo "Waiting for Cloudflare Tunnel URL..."
-
+          
+          echo "Waiting for preview URL to be generated..."
           for attempt in {1..30}; do
             PREVIEW_URL=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' cloudflared.log | head -n 1 || true)
 
             if [ -n "$PREVIEW_URL" ]; then
-              echo "Website preview: $PREVIEW_URL"
+              echo "✓ Website preview available at:"
+              echo "$PREVIEW_URL"
               echo "PREVIEW_URL=$PREVIEW_URL" >> "$GITHUB_ENV"
 
               {
-                echo "## Website Preview"
-                echo
-                echo "Your website is available at:"
-                echo
+                echo "## 🎉 Website Preview"
+                echo ""
+                echo "Your website is now live!"
+                echo ""
+                echo "### Preview URL"
                 echo "### [$PREVIEW_URL]($PREVIEW_URL)"
-                echo
-                echo "> This temporary URL works while this GitHub Actions job is running."
+                echo ""
+                echo "### Admin Panel"
+                echo "### [$PREVIEW_URL/admin]($PREVIEW_URL/admin)"
+                echo ""
+                echo "**Demo Admin Credentials:**"
+                echo "- Username: \`admin\`"
+                echo "- Password: \`admin123456\`"
+                echo ""
+                echo "⏱️ This preview runs while the workflow is active."
+                echo "❌ The URL will stop working if you cancel the workflow."
               } >> "$GITHUB_STEP_SUMMARY"
 
               exit 0
             fi
 
-            sleep 5
+            sleep 3
           done
 
-          echo "Could not create a public preview URL."
+          echo "Could not generate preview URL."
           cat cloudflared.log
           exit 1
 
       - name: Keep preview online
         run: |
-          echo "The website preview is available at:"
-          echo "$PREVIEW_URL"
-          echo
-          echo "Keep this workflow running to keep the preview online."
-
+          echo "Preview is live. Keeping the website online..."
+          
           while true; do
-            if ! curl --fail --silent http://localhost/ > /dev/null; then
-              echo "Website stopped responding."
-              docker compose ps
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/ || echo "000")
+            
+            if [ "$STATUS" != "200" ] && [ "$STATUS" != "301" ]; then
+              echo "Website stopped responding (HTTP $STATUS)"
               docker compose logs --tail=100
               exit 1
             fi
@@ -141,5 +189,6 @@ jobs:
       - name: Stop services
         if: always()
         run: |
-          docker compose logs --tail=200 || true
+          echo "Stopping Docker services..."
+          docker compose logs --tail=100 || true
           docker compose down -v || true
